@@ -1,0 +1,13 @@
+{
+	name = "Report Spam to SpamCop";
+	uuid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890";
+	keyEquivalent = "@^s";
+	input = "none";
+	output = "none";
+	executionMode = "singleMessage";
+	command = "#!/bin/bash\n\"${MM_BUNDLE_SUPPORT}/bin/report_spamcop.sh\"";
+	environment = {
+		MM_RAW_FILE = "${rawFile}";
+		MM_SUBJECT  = "${subject}";
+	};
+}

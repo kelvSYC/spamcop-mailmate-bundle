@@ -1,0 +1,7 @@
+{
+	name = "SpamCop";
+	uuid = "C3A1F2D4-8B5E-4A9C-B6D7-E2F3A4C5D6E7";
+	author = "Your Name";
+	contact = "your@email.com";
+	description = "Submit spam messages to SpamCop for reporting.";
+}
