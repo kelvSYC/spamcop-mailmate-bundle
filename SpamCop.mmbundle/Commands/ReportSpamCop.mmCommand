@@ -8,5 +8,6 @@
 	command = "#!/bin/bash\nMM_RAW_FILE=$(mktemp /tmp/spamcop_raw.XXXXXX)\ncat > \"$MM_RAW_FILE\"\nexport MM_RAW_FILE\n\"${MM_BUNDLE_SUPPORT}/bin/report_spamcop.sh\"\nrm -f \"$MM_RAW_FILE\"";
 	environment = {
 		MM_SUBJECT  = "${subject}";
+		MM_FROM     = "${#recipient.address}";
 	};
 }

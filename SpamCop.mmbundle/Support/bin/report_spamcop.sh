@@ -8,18 +8,21 @@
 # ).
 #
 # If the config file is absent, a one-time setup dialog is shown via osascript.
-# The raw message file is passed in via the MM_RAW_FILE environment variable,
-# which MailMate sets to the path of a temporary file containing the full RFC 822
-# message source.
 #
-# SpamCop requires the spam to be forwarded as a MIME attachment (message/rfc822).
-# We use Python's built-in email/smtplib or, preferably, the system's sendmail
-# to construct and dispatch the wrapper message.
+# The raw message is passed in via the MM_RAW_FILE environment variable, which
+# the .mmCommand wrapper sets to a temp file populated from MailMate's stdin
+# (input = "raw").
+#
+# SpamCop requires the spam to be forwarded as a MIME attachment.  We use
+# MailMate's own `emate` CLI to compose and send the report, which reuses
+# MailMate's configured SMTP accounts (including OAuth2 and Keychain
+# credentials) without any extra credential management.
 #
 # Usage: invoked automatically by MailMate via the bundle command definition.
 
 set -euo pipefail
 
+EMATE="/Applications/MailMate.app/Contents/Resources/emate"
 CONFIG_FILE="$HOME/.spamcop_mailmate"
 
 # ── 1. Resolve configuration ─────────────────────────────────────────────────
@@ -58,73 +61,54 @@ if [[ -z "${MM_RAW_FILE:-}" || ! -f "$MM_RAW_FILE" ]]; then
     exit 1
 fi
 
-# ── 3. Build and send the wrapper message via Python ─────────────────────────
-#
-# The wrapper message:
-#   From:    (local user — sendmail fills in the envelope)
-#   To:      <submission address>
-#   Subject: [SpamCop] <original subject>
-#   Body:    brief note (SpamCop ignores it)
-#   Attachment: the original spam as message/rfc822
-#
-# Python 3 is available on macOS 12+ via /usr/bin/python3; we also try the
-# Homebrew path for older setups.
+# ── 3. Verify emate is available ─────────────────────────────────────────────
 
-PYTHON=$(command -v python3 2>/dev/null || command -v /usr/local/bin/python3 2>/dev/null || true)
-
-if [[ -z "$PYTHON" ]]; then
-    osascript -e 'display alert "SpamCop: python3 not found. Please install Python 3." as critical'
+if [[ ! -x "$EMATE" ]]; then
+    osascript -e 'display alert "SpamCop: emate not found. Is MailMate installed in /Applications?" as critical'
     exit 1
 fi
 
+# ── 4. Send via emate ───────────────────────────────────────────────────────
+#
+# emate mailto --send-now composes and immediately sends the message using
+# MailMate's configured SMTP accounts.  The raw spam is attached as a .eml
+# file so SpamCop can parse its headers.
+#
+# We rename the temp file to have a .eml extension so that emate (and the
+# receiving MTA) can identify it as an email message.
+
+EML_FILE="${MM_RAW_FILE}.eml"
+cp "$MM_RAW_FILE" "$EML_FILE"
+
 SAFE_SUBJECT="${MM_SUBJECT:-spam report}"
 
-"$PYTHON" - <<PYEOF
-import os, sys, smtplib
-from email.message import EmailMessage
-from email.headerregistry import Address
-import socket
-
-submission_address = "${SUBMISSION_ADDRESS}"
-raw_file           = "${MM_RAW_FILE}"
-subject_hint       = "${SAFE_SUBJECT}"
-
-# Read the raw spam message bytes
-with open(raw_file, "rb") as fh:
-    spam_bytes = fh.read()
-
-# Build the wrapper message
-msg = EmailMessage()
-msg["To"]      = submission_address
-msg["Subject"] = f"[SpamCop] {subject_hint}"
-msg.set_content(
-    "Spam report submitted via MailMate SpamCop bundle.\n"
-    "Please find the reported message attached.\n"
+# Build the emate command
+EMATE_ARGS=(
+    mailto
+    --to "$SUBMISSION_ADDRESS"
+    --subject "[SpamCop] ${SAFE_SUBJECT}"
+    --send-now
 )
 
-# Attach the original as message/rfc822 — required by SpamCop
-msg.add_attachment(
-    spam_bytes,
-    maintype="message",
-    subtype="rfc822",
-    filename="spam.eml",
-)
+# If MM_FROM is set (passed from the .mmCommand environment), use it to
+# select the sending identity.  This auto-matches the account that received
+# the spam.  If unset or empty, emate picks the default identity.
+if [[ -n "${MM_FROM:-}" ]]; then
+    EMATE_ARGS+=(--from "$MM_FROM")
+fi
 
-# Deliver via local sendmail (available on macOS with Postfix)
-try:
-    import subprocess
-    proc = subprocess.run(
-        ["/usr/sbin/sendmail", "-t", "-oi"],
-        input=msg.as_bytes(),
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.decode())
-except Exception as exc:
-    print(f"ERROR: {exc}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
+# Attach the raw spam message
+EMATE_ARGS+=("$EML_FILE")
 
-# ── 4. Notify success ─────────────────────────────────────────────────────────
+if ! "$EMATE" "${EMATE_ARGS[@]}" 2>/tmp/spamcop_emate_err.log; then
+    ERROR_MSG=$(cat /tmp/spamcop_emate_err.log 2>/dev/null || echo "Unknown error")
+    osascript -e "display alert \"SpamCop: Failed to send report.\" message \"${ERROR_MSG}\" as critical"
+    rm -f "$EML_FILE" /tmp/spamcop_emate_err.log
+    exit 1
+fi
+
+rm -f "$EML_FILE" /tmp/spamcop_emate_err.log
+
+# ── 5. Notify success ─────────────────────────────────────────────────────────
 
 osascript -e "display notification \"Spam forwarded to SpamCop.\" with title \"SpamCop\" subtitle \"Submitted to ${SUBMISSION_ADDRESS}\""
