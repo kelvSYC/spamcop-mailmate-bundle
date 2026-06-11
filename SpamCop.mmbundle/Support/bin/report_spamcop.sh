@@ -18,6 +18,17 @@
 # MailMate's configured SMTP accounts (including OAuth2 and Keychain
 # credentials) without any extra credential management.
 #
+# IMPORTANT — reentrancy:  `emate` does not send mail itself.  It hands a
+# `mailto:` URL to the *already-running* MailMate.app via an AppleEvent and
+# asks it to compose/send.  MailMate runs this bundle command synchronously:
+# its main runloop is blocked until this script returns.  If we invoked emate
+# and waited for it here, emate's AppleEvent could not be serviced (MailMate
+# is busy waiting for us) — a reentrant deadlock that freezes MailMate until
+# the AppleEvent times out (~120 s) and forces a kill.  To avoid this we fire
+# emate in a fully detached background session (perl + POSIX::setsid, since
+# macOS has no setsid(1)) and return immediately, freeing MailMate's runloop
+# to handle the AppleEvent.  Success/failure is reported asynchronously.
+#
 # Usage: invoked automatically by MailMate via the bundle command definition.
 
 set -euo pipefail
@@ -68,14 +79,13 @@ if [[ ! -x "$EMATE" ]]; then
     exit 1
 fi
 
-# ── 4. Send via emate ───────────────────────────────────────────────────────
+# ── 4. Send via emate (detached) ─────────────────────────────────────────────
 #
-# emate mailto --send-now composes and immediately sends the message using
-# MailMate's configured SMTP accounts.  The raw spam is attached as a .eml
-# file so SpamCop can parse its headers.
-#
-# We rename the temp file to have a .eml extension so that emate (and the
-# receiving MTA) can identify it as an email message.
+# The raw spam is attached as a .eml file so SpamCop can parse its headers.
+# We copy the temp file to a .eml name so emate (and the receiving MTA) can
+# identify it as an email message.  The .eml copy is used — not MM_RAW_FILE —
+# because the .mmCommand wrapper deletes MM_RAW_FILE as soon as this script
+# returns, which (by design) happens before the detached emate runs.
 
 EML_FILE="${MM_RAW_FILE}.eml"
 cp "$MM_RAW_FILE" "$EML_FILE"
@@ -100,15 +110,35 @@ fi
 # Attach the raw spam message
 EMATE_ARGS+=("$EML_FILE")
 
-if ! "$EMATE" "${EMATE_ARGS[@]}" 2>/tmp/spamcop_emate_err.log; then
-    ERROR_MSG=$(cat /tmp/spamcop_emate_err.log 2>/dev/null || echo "Unknown error")
+# Worker: runs in the detached session.  "$@" is the emate command + args.
+# A brief sleep lets MailMate finish executing this command (freeing its
+# runloop) before emate's AppleEvent arrives.  Result is reported via the
+# GUI notification/alert, which survives setsid (the Mach bootstrap port is
+# inherited through the process tree, not the POSIX session).
+read -r -d '' SPAMCOP_WORKER <<'WORKER_EOF' || true
+sleep 1
+if "$@" 2>"$SPAMCOP_ERR_LOG"; then
+    osascript -e "display notification \"Spam forwarded to SpamCop.\" with title \"SpamCop\" subtitle \"Submitted to ${SPAMCOP_SUBMIT_ADDR}\""
+    rm -f "$SPAMCOP_ERR_LOG"
+else
+    ERROR_MSG=$(cat "$SPAMCOP_ERR_LOG" 2>/dev/null || echo "Unknown error")
     osascript -e "display alert \"SpamCop: Failed to send report.\" message \"${ERROR_MSG}\" as critical"
-    rm -f "$EML_FILE" /tmp/spamcop_emate_err.log
-    exit 1
 fi
+rm -f "$SPAMCOP_EML_FILE"
+WORKER_EOF
 
-rm -f "$EML_FILE" /tmp/spamcop_emate_err.log
+export SPAMCOP_ERR_LOG="/tmp/spamcop_emate_err.log"
+export SPAMCOP_EML_FILE="$EML_FILE"
+export SPAMCOP_SUBMIT_ADDR="$SUBMISSION_ADDRESS"
 
-# ── 5. Notify success ─────────────────────────────────────────────────────────
+# Detach into a new session and return immediately.  macOS has no setsid(1),
+# so we daemonize with perl: the forked parent exits, the child (not a process
+# group leader) calls setsid() to leave MailMate's process group, then execs
+# the worker.  This guarantees the worker is never reaped when MailMate
+# finishes the command.
+/usr/bin/perl -MPOSIX -e 'fork and exit; POSIX::setsid(); exec @ARGV or die "$!";' \
+    /bin/bash -c "$SPAMCOP_WORKER" _ "$EMATE" "${EMATE_ARGS[@]}" >/dev/null 2>&1 &
+disown 2>/dev/null || true
 
-osascript -e "display notification \"Spam forwarded to SpamCop.\" with title \"SpamCop\" subtitle \"Submitted to ${SUBMISSION_ADDRESS}\""
+# Return now so MailMate's runloop is free to service emate's AppleEvent.
+exit 0
