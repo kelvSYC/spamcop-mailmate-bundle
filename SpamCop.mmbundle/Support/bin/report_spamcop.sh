@@ -92,11 +92,21 @@ cp "$MM_RAW_FILE" "$EML_FILE"
 
 SAFE_SUBJECT="${MM_SUBJECT:-spam report}"
 
-# Build the emate command
+# Build the emate command.
+#
+# --nosign / --noencrypt are REQUIRED.  If the sending identity has OpenPGP
+# (or S/MIME) signing enabled by default and no usable secret key exists for
+# that address, MailMate's --send-now silently fails to generate the message
+# ("gpg: signing failed: No secret key") and parks it in Drafts instead of
+# sending — emate still returns success, so the failure is invisible.  A
+# SpamCop report must never be signed or encrypted anyway, so we explicitly
+# disable both to guarantee the message can be submitted.
 EMATE_ARGS=(
     mailto
     --to "$SUBMISSION_ADDRESS"
     --subject "[SpamCop] ${SAFE_SUBJECT}"
+    --nosign
+    --noencrypt
     --send-now
 )
 
